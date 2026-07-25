@@ -3,10 +3,12 @@ from uuid import UUID
 from typing import Sequence, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from fastapi import BackgroundTasks
 
 from app.models.contact_request import ContactRequest, ContactStatus
 from app.schemas.contact import ContactCreate
 from app.utils.email import EmailService
+from app.utils.broadcaster import broadcaster
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +19,7 @@ class ContactService:
     """
     
     @staticmethod
-    async def create_contact(db: AsyncSession, contact_data: ContactCreate) -> ContactRequest:
+    async def create_contact(db: AsyncSession, contact_data: ContactCreate, background_tasks: BackgroundTasks = None) -> ContactRequest:
         """
         Transforms validated Pydantic data into an ORM model and saves it.
         """
@@ -38,11 +40,24 @@ class ContactService:
             await db.commit()           # Flush to Postgres and finalize transaction
             await db.refresh(db_contact) # Reload the object from DB to get the generated 'id' and 'created_at'
             
+            # Broadcast real-time SSE event to connected Admin Dashboards
+            lead_type = "Discovery Call" if "discovery call" in (contact_data.message or "").lower() else "Contact Form"
+            await broadcaster.broadcast("new_lead", {
+                "id": str(db_contact.id),
+                "name": db_contact.name,
+                "company": db_contact.company or "Not specified",
+                "email": db_contact.email,
+                "message": db_contact.message,
+                "status": "New",
+                "createdAt": db_contact.created_at.isoformat(),
+                "type": lead_type
+            })
+
             # Email Delivery is a Side Effect. 
-            # It ONLY happens after the database safely committed.
-            # We don't await this because smtplib is synchronous, but in a production 
-            # async environment we would offload this to a background task or thread.
-            EmailService.send_contact_notification(db_contact)
+            if background_tasks:
+                background_tasks.add_task(EmailService.send_contact_notification, db_contact)
+            else:
+                EmailService.send_contact_notification(db_contact)
             
             return db_contact
         except Exception as e:
